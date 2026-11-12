@@ -959,6 +959,32 @@ static void *test_cancel_all_worker (void *ptr) {
     return NULL;
 }
 
+static int test_cancelling;
+
+static void *test_cancel_loop (void *ptr) {
+    (void)ptr;
+    while (__atomic_load_n(&test_cancelling, __ATOMIC_ACQUIRE)) sqlitejs_cancel_all();
+    return NULL;
+}
+
+// Opens connections while another thread cancels without pause. Setting up a connection runs
+// JavaScript of its own, and a cancel that stopped it made the connection fail to load.
+static int test_cancel_during_open (void) {
+    pthread_t thread;
+    __atomic_store_n(&test_cancelling, 1, __ATOMIC_RELEASE);
+    if (pthread_create(&thread, NULL, test_cancel_loop, NULL) != 0) return SQLITE_ERROR;
+    int rc = SQLITE_OK;
+    for (int i = 0; (i < 200) && (rc == SQLITE_OK); ++i) {
+        sqlite3 *db = NULL;
+        rc = test_open(&db);
+        if (rc != SQLITE_OK) printf("FAIL: connection %d did not open while another thread cancelled: %s\n", i, db ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
+        if (db) sqlite3_close(db);
+    }
+    __atomic_store_n(&test_cancelling, 0, __ATOMIC_RELEASE);
+    pthread_join(thread, NULL);
+    return rc;
+}
+
 // sqlitejs_cancel_all() stops the JavaScript running in every connection, as Android's own
 // cancelling (a progress handler, which SQLite never calls while a function runs) cannot.
 int test_cancel_all (void) {
@@ -1000,6 +1026,10 @@ int test_cancel_all (void) {
     rc = test_open(&db2);
     if (rc != SQLITE_OK) goto abort_test;
     rc = check_query(db2, "SELECT js_eval('2 + 2');", "4");
+    if (rc != SQLITE_OK) goto abort_test;
+
+    // and a connection opened while cancels go on still loads the extension
+    rc = test_cancel_during_open();
 
 abort_test:
     test_watchdog_stop = 1;
